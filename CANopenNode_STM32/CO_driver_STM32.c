@@ -172,7 +172,8 @@ CO_CANmodule_init(CO_CANmodule_t* CANmodule, void* CANptr, CO_CANrx_t rxArray[],
 #ifdef CO_STM32_FDCAN_Driver
     if (HAL_FDCAN_ActivateNotification(((CANopenNodeSTM32*)CANptr)->CANHandle,
                                        0 | FDCAN_IT_RX_FIFO0_NEW_MESSAGE | FDCAN_IT_RX_FIFO1_NEW_MESSAGE
-                                           | FDCAN_IT_TX_COMPLETE | FDCAN_IT_TX_FIFO_EMPTY | FDCAN_IT_BUS_OFF
+                                           | FDCAN_IT_TX_COMPLETE | FDCAN_IT_TX_ABORT_COMPLETE
+                                           | FDCAN_IT_TX_FIFO_EMPTY | FDCAN_IT_BUS_OFF
                                            | FDCAN_IT_ARB_PROTOCOL_ERROR | FDCAN_IT_DATA_PROTOCOL_ERROR
                                            | FDCAN_IT_ERROR_PASSIVE | FDCAN_IT_ERROR_WARNING,
                                        FDCAN_BUFFER_INDEXES)
@@ -345,6 +346,43 @@ prv_send_can_message(CO_CANmodule_t* CANmodule, CO_CANtx_t* buffer) {
     return success;
 }
 
+/**
+ * \brief           Move pending messages from the software buffers into the hardware
+ *
+ * Messages are transmitted in the order they were queued, so the CANopen
+ * protocols (SDO segmented transfer, LSS, ...) never see reordered frames.
+ * A buffer is released as soon as it has been handed over to the hardware.
+ *
+ * \param[in]       CANmodule: CAN module instance
+ * \note            Must be called with the CAN send lock held.
+ */
+static void
+prv_flush_tx_queue(CO_CANmodule_t* CANmodule) {
+    CO_CANtx_t* buffer = &CANmodule->txArray[0];
+    uint16_t pending = 0U;
+    bool_t hwFull = false;
+
+    for (uint16_t i = CANmodule->txSize; i > 0U; --i, ++buffer) {
+        if (!buffer->bufferFull) {
+            continue;
+        }
+        if (!hwFull) {
+            if (prv_send_can_message(CANmodule, buffer)) {
+                buffer->bufferFull = false;
+                CANmodule->bufferInhibitFlag = buffer->syncFlag;
+                continue;
+            }
+            /* No free hardware buffer, the rest stays queued */
+            hwFull = true;
+        }
+        pending++;
+    }
+
+    /* Recalculate instead of decrement: this also repairs the counter if a
+     * transmit interrupt was lost at some point */
+    CANmodule->CANtxCount = pending;
+}
+
 /******************************************************************************/
 CO_ReturnError_t
 CO_CANsend(CO_CANmodule_t* CANmodule, CO_CANtx_t* buffer) {
@@ -365,7 +403,10 @@ CO_CANsend(CO_CANmodule_t* CANmodule, CO_CANtx_t* buffer) {
      * Lock interrupts for atomic operation
      */
     CO_LOCK_CAN_SEND(CANmodule);
-    if (prv_send_can_message(CANmodule, buffer)) {
+    /* Only bypass the software queue when it is empty, otherwise this message
+     * would overtake the ones already waiting */
+    if (CANmodule->CANtxCount == 0U && prv_send_can_message(CANmodule, buffer)) {
+        buffer->bufferFull = false;
         CANmodule->bufferInhibitFlag = buffer->syncFlag;
     } else {
         /* Only increment count if buffer wasn't already full */
@@ -423,12 +464,21 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
     uint32_t err = 0;
 
     // CANOpen just care about Bus_off, Warning, Passive and Overflow
-    // I didn't find overflow error register in STM32, if you find it please let me know
 
 #ifdef CO_STM32_FDCAN_Driver
+    FDCAN_HandleTypeDef* hcan = (FDCAN_HandleTypeDef*)((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle;
 
-    err = ((FDCAN_HandleTypeDef*)((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle)->Instance->PSR
-          & (FDCAN_PSR_BO | FDCAN_PSR_EW | FDCAN_PSR_EP);
+    /* Receive overrun: the Rx FIFOs report the messages they had to drop */
+    if (__HAL_FDCAN_GET_FLAG(hcan, FDCAN_FLAG_RX_FIFO0_MESSAGE_LOST) != 0U) {
+        __HAL_FDCAN_CLEAR_FLAG(hcan, FDCAN_FLAG_RX_FIFO0_MESSAGE_LOST);
+        CANmodule->CANerrorStatus |= CO_CAN_ERRRX_OVERFLOW;
+    }
+    if (__HAL_FDCAN_GET_FLAG(hcan, FDCAN_FLAG_RX_FIFO1_MESSAGE_LOST) != 0U) {
+        __HAL_FDCAN_CLEAR_FLAG(hcan, FDCAN_FLAG_RX_FIFO1_MESSAGE_LOST);
+        CANmodule->CANerrorStatus |= CO_CAN_ERRRX_OVERFLOW;
+    }
+
+    err = hcan->Instance->PSR & (FDCAN_PSR_BO | FDCAN_PSR_EW | FDCAN_PSR_EP);
 
     if (CANmodule->errOld != err) {
 
@@ -438,7 +488,13 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
 
         if (err & FDCAN_PSR_BO) {
             status |= CO_CAN_ERRTX_BUS_OFF;
-            // In this driver we expect that the controller is automatically handling the protocol exceptions.
+            /* FDCAN sets the INIT bit when it enters bus off and stays there until
+             * software clears it again, so recovery has to be triggered here.
+             * Pending transmissions were aborted by the hardware, they are re-sent
+             * from the software queue below. */
+            if (HAL_FDCAN_Stop(hcan) == HAL_OK) {
+                (void)HAL_FDCAN_Start(hcan);
+            }
 
         } else {
             /* recalculate CANerrorStatus, first clear some flags */
@@ -458,11 +514,20 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
         CANmodule->CANerrorStatus = status;
     }
 #else
+    CAN_HandleTypeDef* hcan = (CAN_HandleTypeDef*)((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle;
 
-    err = ((CAN_HandleTypeDef*)((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle)->Instance->ESR
-          & (CAN_ESR_BOFF | CAN_ESR_EPVF | CAN_ESR_EWGF);
+    /* Receive overrun: FIFO was full when a further message arrived */
+    if (__HAL_CAN_GET_FLAG(hcan, CAN_FLAG_FOV0)) {
+        __HAL_CAN_CLEAR_FLAG(hcan, CAN_FLAG_FOV0);
+        CANmodule->CANerrorStatus |= CO_CAN_ERRRX_OVERFLOW;
+    }
+    if (__HAL_CAN_GET_FLAG(hcan, CAN_FLAG_FOV1)) {
+        __HAL_CAN_CLEAR_FLAG(hcan, CAN_FLAG_FOV1);
+        CANmodule->CANerrorStatus |= CO_CAN_ERRRX_OVERFLOW;
+    }
 
-    //    uint32_t esrVal = ((CAN_HandleTypeDef*)((CANopenNodeSTM32*)CANmodule->CANptr)->CANHandle)->Instance->ESR; Debug purpose
+    err = hcan->Instance->ESR & (CAN_ESR_BOFF | CAN_ESR_EPVF | CAN_ESR_EWGF);
+
     if (CANmodule->errOld != err) {
 
         uint16_t status = CANmodule->CANerrorStatus;
@@ -471,7 +536,15 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
 
         if (err & CAN_ESR_BOFF) {
             status |= CO_CAN_ERRTX_BUS_OFF;
-            // In this driver, we assume that auto bus recovery is activated ! so this error will eventually handled automatically.
+            /* With ABOM the controller recovers on its own. Without it the node
+             * would stay bus off until the next reset, so recover manually.
+             * Pending transmissions were aborted by the hardware in both cases,
+             * they are re-sent from the software queue below. */
+            if (hcan->Init.AutoBusOff == DISABLE) {
+                if (HAL_CAN_Stop(hcan) == HAL_OK) {
+                    (void)HAL_CAN_Start(hcan);
+                }
+            }
 
         } else {
             /* recalculate CANerrorStatus, first clear some flags */
@@ -492,6 +565,20 @@ CO_CANmodule_process(CO_CANmodule_t* CANmodule) {
     }
 
 #endif
+
+    /* Restart the software transmit queue if it got stuck.
+     *
+     * The queue is normally drained from the transmit interrupt, but that
+     * interrupt is not guaranteed to arrive: the HAL calls no callback when a
+     * mailbox reports arbitration lost or transmit error, bus off aborts all
+     * pending requests, and a core halted by the debugger can miss events as
+     * well. Without this the node would keep the messages queued forever and
+     * only recover on reset or communication reset. */
+    if (CANmodule->CANnormal && CANmodule->CANtxCount > 0U) {
+        CO_LOCK_CAN_SEND(CANmodule);
+        prv_flush_tx_queue(CANmodule);
+        CO_UNLOCK_CAN_SEND(CANmodule);
+    }
 }
 
 /**
@@ -517,7 +604,7 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
     uint8_t messageFound = 0;
 
 #ifdef CO_STM32_FDCAN_Driver
-    static FDCAN_RxHeaderTypeDef rx_hdr;
+    FDCAN_RxHeaderTypeDef rx_hdr;
     /* Read received message from FIFO */
     if (HAL_FDCAN_GetRxMessage(hfdcan, fifo, &rx_hdr, rcvMsg.data) != HAL_OK) {
         return;
@@ -558,7 +645,7 @@ prv_read_can_received_msg(CAN_HandleTypeDef* hcan, uint32_t fifo, uint32_t fifo_
     }
     rcvMsgIdent = rcvMsg.ident;
 #else
-    static CAN_RxHeaderTypeDef rx_hdr;
+    CAN_RxHeaderTypeDef rx_hdr;
     /* Read received message from FIFO */
     if (HAL_CAN_GetRxMessage(hcan, fifo, &rx_hdr, rcvMsg.data) != HAL_OK) {
         return;
@@ -630,12 +717,9 @@ HAL_FDCAN_RxFifo1Callback(FDCAN_HandleTypeDef* hfdcan, uint32_t RxFifo1ITs) {
  */
 void
 HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef* hfdcan, uint32_t BufferIndexes) {
-    CANModule_local->firstCANtxMessage = false;            /* First CAN message (bootup) was sent successfully */
-    CANModule_local->bufferInhibitFlag = false;            /* Clear flag from previous message */
-    if (CANModule_local->CANtxCount > 0U) {                /* Are there any new messages waiting to be send */
-        CO_CANtx_t* buffer = &CANModule_local->txArray[0]; /* Start with first buffer handle */
-        uint16_t i;
-
+    CANModule_local->firstCANtxMessage = false; /* First CAN message (bootup) was sent successfully */
+    CANModule_local->bufferInhibitFlag = false; /* Clear flag from previous message */
+    if (CANModule_local->CANtxCount > 0U) {     /* Are there any new messages waiting to be send */
         /*
          * Try to send more buffers, process all empty ones
          *
@@ -645,18 +729,27 @@ HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef* hfdcan, uint32_t BufferI
          *  then no need to lock interrupts..)
          */
         CO_LOCK_CAN_SEND(CANModule_local);
-        for (i = CANModule_local->txSize; i > 0U; --i, ++buffer) {
-            /* Try to send message */
-            if (buffer->bufferFull) {
-                if (prv_send_can_message(CANModule_local, buffer)) {
-                    buffer->bufferFull = false;
-                    CANModule_local->CANtxCount--;
-                    CANModule_local->bufferInhibitFlag = buffer->syncFlag;
-                } else {
-                    break;  // if we could not send the message, break out of the loop (the tx buffers are full)
-                }
-            }
-        }
+        prv_flush_tx_queue(CANModule_local);
+        CO_UNLOCK_CAN_SEND(CANModule_local);
+    }
+}
+
+/**
+ * \brief           Transmission of a message was aborted
+ *
+ * The message itself is lost, but the queued ones must still be sent. Without
+ * this the software queue would never be drained again.
+ *
+ * \param[in]       hfdcan: pointer to an FDCAN_HandleTypeDef structure that contains
+ *                      the configuration information for the specified FDCAN.
+ * \param[in]       BufferIndexes: Bits of aborted TX buffers
+ */
+void
+HAL_FDCAN_TxBufferAbortCallback(FDCAN_HandleTypeDef* hfdcan, uint32_t BufferIndexes) {
+    CANModule_local->bufferInhibitFlag = false;
+    if (CANModule_local->CANtxCount > 0U) {
+        CO_LOCK_CAN_SEND(CANModule_local);
+        prv_flush_tx_queue(CANModule_local);
         CO_UNLOCK_CAN_SEND(CANModule_local);
     }
 }
@@ -690,12 +783,9 @@ HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef* hcan) {
 void
 CO_CANinterrupt_TX(CO_CANmodule_t* CANmodule, uint32_t MailboxNumber) {
 
-    CANmodule->firstCANtxMessage = false;            /* First CAN message (bootup) was sent successfully */
-    CANmodule->bufferInhibitFlag = false;            /* Clear flag from previous message */
-    if (CANmodule->CANtxCount > 0U) {                /* Are there any new messages waiting to be send */
-        CO_CANtx_t* buffer = &CANmodule->txArray[0]; /* Start with first buffer handle */
-        uint16_t i;
-
+    CANmodule->firstCANtxMessage = false; /* First CAN message (bootup) was sent successfully */
+    CANmodule->bufferInhibitFlag = false; /* Clear flag from previous message */
+    if (CANmodule->CANtxCount > 0U) {     /* Are there any new messages waiting to be send */
         /*
 		 * Try to send more buffers, process all empty ones
 		 *
@@ -705,18 +795,27 @@ CO_CANinterrupt_TX(CO_CANmodule_t* CANmodule, uint32_t MailboxNumber) {
 		 *  then no need to lock interrupts..)
 		 */
         CO_LOCK_CAN_SEND(CANmodule);
-        for (i = CANmodule->txSize; i > 0U; --i, ++buffer) {
-            /* Try to send message */
-            if (buffer->bufferFull) {
-                if (prv_send_can_message(CANmodule, buffer)) {
-                    buffer->bufferFull = false;
-                    CANmodule->CANtxCount--;
-                    CANmodule->bufferInhibitFlag = buffer->syncFlag;
-                }
-                else
-                    break;  // if we could not send the message, break out of the loop (the tx buffers are full)
-            }
-        }
+        prv_flush_tx_queue(CANmodule);
+        CO_UNLOCK_CAN_SEND(CANmodule);
+    }
+}
+
+/**
+ * \brief           Transmission from a mailbox was aborted
+ *
+ * Happens on bus off, or on arbitration lost / transmit error when automatic
+ * retransmission is disabled. The message itself is lost, but the queued ones
+ * must still be sent, otherwise the software queue stays blocked until the
+ * next (communication) reset.
+ *
+ * \param[in]       CANmodule: CAN module instance
+ */
+static void
+prv_tx_aborted(CO_CANmodule_t* CANmodule) {
+    CANmodule->bufferInhibitFlag = false;
+    if (CANmodule->CANtxCount > 0U) {
+        CO_LOCK_CAN_SEND(CANmodule);
+        prv_flush_tx_queue(CANmodule);
         CO_UNLOCK_CAN_SEND(CANmodule);
     }
 }
@@ -728,11 +827,26 @@ HAL_CAN_TxMailbox0CompleteCallback(CAN_HandleTypeDef* hcan) {
 
 void
 HAL_CAN_TxMailbox1CompleteCallback(CAN_HandleTypeDef* hcan) {
-    CO_CANinterrupt_TX(CANModule_local, CAN_TX_MAILBOX0);
+    CO_CANinterrupt_TX(CANModule_local, CAN_TX_MAILBOX1);
 }
 
 void
 HAL_CAN_TxMailbox2CompleteCallback(CAN_HandleTypeDef* hcan) {
-    CO_CANinterrupt_TX(CANModule_local, CAN_TX_MAILBOX0);
+    CO_CANinterrupt_TX(CANModule_local, CAN_TX_MAILBOX2);
+}
+
+void
+HAL_CAN_TxMailbox0AbortCallback(CAN_HandleTypeDef* hcan) {
+    prv_tx_aborted(CANModule_local);
+}
+
+void
+HAL_CAN_TxMailbox1AbortCallback(CAN_HandleTypeDef* hcan) {
+    prv_tx_aborted(CANModule_local);
+}
+
+void
+HAL_CAN_TxMailbox2AbortCallback(CAN_HandleTypeDef* hcan) {
+    prv_tx_aborted(CANModule_local);
 }
 #endif
